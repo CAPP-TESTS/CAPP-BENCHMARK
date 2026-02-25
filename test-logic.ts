@@ -1,6 +1,6 @@
 
-import { parsePdfBuffer } from './src/services/pdfParser';
-import { computeMetrics } from './src/services/metrics';
+import { parsePdfBuffer } from './api/_lib/pdfParser';
+import { computeMetrics } from './api/_lib/metrics';
 
 async function test() {
   try {

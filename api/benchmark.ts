@@ -1,6 +1,6 @@
 import multer from 'multer';
-import { parsePdfBuffer } from '../src/services/pdfParser';
-import { computeMetrics, computeScores } from '../src/services/metrics';
+import { parsePdfBuffer } from './_lib/pdfParser';
+import { computeMetrics, computeScores } from './_lib/metrics';
 
 // Disable Vercel's default body parser so multer can handle multipart
 export const config = {

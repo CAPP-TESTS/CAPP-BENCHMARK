@@ -1,4 +1,4 @@
-import { parsePdfBuffer } from './src/services/pdfParser';
+import { parsePdfBuffer } from './api/_lib/pdfParser';
 import fs from 'fs';
 import path from 'path';
 
