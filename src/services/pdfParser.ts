@@ -1,5 +1,9 @@
 import pdfParse from 'pdf-parse';
 
+// ═══════════════════════════════════════════════════════════════
+// Interfaces
+// ═══════════════════════════════════════════════════════════════
+
 export interface Operation {
   op_num: number;
   op_total: number;
@@ -25,6 +29,112 @@ export interface ParsedPDF {
   name: string;
   setups: Setup[];
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Layout-aware PDF text renderer
+//
+// The default pdf-parse renderer concatenates text items without
+// spaces and uses strict Y equality for line breaks, producing
+// garbled output for structured PDFs.
+//
+// This renderer reconstructs text layout using x/y coordinates,
+// similar to pdfplumber/pdfminer:
+//   1. Collect all text items with their positions
+//   2. Group items into lines by Y proximity
+//   3. Sort lines top-to-bottom, items left-to-right
+//   4. Insert spaces based on X gaps between items
+// ═══════════════════════════════════════════════════════════════
+
+interface TextItem {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function layoutAwareRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({
+    normalizeWhitespace: false,
+    disableCombineTextItems: false,
+  }).then((textContent: any) => {
+    if (!textContent.items || textContent.items.length === 0) return '';
+
+    // Collect items with position info from the transform matrix
+    // transform = [scaleX, shearX, shearY, scaleY, translateX, translateY]
+    const items: TextItem[] = [];
+    for (const raw of textContent.items) {
+      if (raw.str === undefined || raw.str === '') continue;
+      const tx = raw.transform;
+      const fontSize = Math.abs(tx[0]) || Math.abs(tx[3]) || 12;
+      items.push({
+        str: raw.str,
+        x: tx[4],
+        y: tx[5],  // PDF Y axis: increases upward
+        width: raw.width != null && raw.width > 0
+          ? raw.width
+          : raw.str.length * fontSize * 0.5,  // estimate if missing
+        height: fontSize,
+      });
+    }
+
+    if (items.length === 0) return '';
+
+    // Calculate thresholds based on average font size
+    const avgHeight = items.reduce((s, i) => s + i.height, 0) / items.length;
+    const yTolerance = avgHeight * 0.35;
+
+    // Sort by Y descending (top of page first), then X ascending
+    items.sort((a, b) => b.y - a.y || a.x - b.x);
+
+    // Group into lines by Y proximity
+    const lines: TextItem[][] = [];
+    let currentLine: TextItem[] = [items[0]];
+    let lineY = items[0].y;
+
+    for (let i = 1; i < items.length; i++) {
+      if (Math.abs(items[i].y - lineY) <= yTolerance) {
+        currentLine.push(items[i]);
+      } else {
+        lines.push(currentLine);
+        currentLine = [items[i]];
+        lineY = items[i].y;
+      }
+    }
+    if (currentLine.length > 0) lines.push(currentLine);
+
+    // Reconstruct each line with proper spacing
+    const textLines: string[] = [];
+    for (const line of lines) {
+      line.sort((a, b) => a.x - b.x);
+
+      let lineText = '';
+      for (let k = 0; k < line.length; k++) {
+        if (k > 0) {
+          const prevEnd = line[k - 1].x + line[k - 1].width;
+          const gap = line[k].x - prevEnd;
+          const charWidth = avgHeight * 0.5;
+
+          if (gap > charWidth * 3) {
+            lineText += '  ';  // Large gap → multi-space (column separator)
+          } else if (gap > charWidth * 0.15) {
+            lineText += ' ';   // Normal word space
+          }
+          // else: items touching/overlapping → no space
+        }
+        lineText += line[k].str;
+      }
+
+      textLines.push(lineText);
+    }
+
+    return textLines.join('\n');
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Parsing helpers — aligned with benchmark_cnc.py
+// ═══════════════════════════════════════════════════════════════
 
 function parseCycleTime(text: string): number {
   text = text.trim().split('(')[0].trim();
@@ -52,19 +162,20 @@ function detectStrategy(opText: string): string {
   const stratMatch = opText.match(/Strategy:\s*([A-Za-z]+(?:\s+[A-Za-z0-9]+)?)/);
   if (stratMatch) {
     const raw = stratMatch[1].trim();
-    const known = ["Adaptive", "Facing", "Contour 2D", "Contour", "Drilling",
-                   "Scallop", "Bore", "Pocket", "Slot", "Trace", "Radial",
-                   "Spiral", "Morphed Spiral", "Parallel", "Pencil", "Steep and Shallow"];
+    const known = [
+      "Adaptive", "Facing", "Contour 2D", "Contour", "Drilling",
+      "Scallop", "Bore", "Pocket", "Slot", "Trace", "Radial",
+      "Spiral", "Morphed Spiral", "Parallel", "Pencil", "Steep and Shallow",
+    ];
     for (const k of known) {
       if (raw.startsWith(k)) return k;
     }
-    return raw.split(/\s+/)[0];
+    return raw.split(/\s+/)[0]; // fallback: first word
   }
 
   const descMatch = opText.match(/Description:\s*(?:\d+\s+)?(\w+)/);
   if (descMatch) {
-    const descWord = descMatch[1];
-    if (descWord.toLowerCase().startsWith("flat")) return "Flat";
+    if (descMatch[1].toLowerCase().startsWith("flat")) return "Flat";
   }
 
   return "Unknown";
@@ -82,12 +193,18 @@ function extractProductCode(opText: string): string {
   return "N/A";
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Main parser — regex patterns aligned with benchmark_cnc.py
+// ═══════════════════════════════════════════════════════════════
+
 export async function parsePdfBuffer(buffer: Buffer, originalName: string): Promise<ParsedPDF> {
-  const data = await pdfParse(buffer);
+  // Use layout-aware renderer instead of pdf-parse's default
+  const data = await pdfParse(buffer, { pagerender: layoutAwareRender });
   const fullText = data.text;
 
   const result: ParsedPDF = { name: '', setups: [] };
 
+  // Document name (same as Python)
   const docMatch = fullText.match(/Document Path:\s*(.+)/);
   if (docMatch) {
     result.name = docMatch[1].trim();
@@ -95,61 +212,66 @@ export async function parsePdfBuffer(buffer: Buffer, originalName: string): Prom
     result.name = originalName.replace(/\.pdf$/i, '');
   }
 
-  // Fallback: if splitting by "Setup Sheet" fails to find blocks with operations, 
-  // we might be dealing with a single page or different format.
-  // We will try to parse operations from the whole text if the split method yields no results.
-  
-  let setupBlocks = fullText.split(/(?=Setup Sheet)/i).filter(b => b.trim() && /Setup Sheet/i.test(b));
-  
+  // Split by "Setup Sheet for Program <N>" — same regex as Python
+  let setupBlocks = fullText.split(/(?=Setup Sheet for Program \d+)/)
+    .filter(b => b.trim() && /Setup Sheet for Program/.test(b));
+
   if (setupBlocks.length === 0) {
-    // If no explicit setup blocks found, treat the entire text as one setup
+    // Fallback: try looser split
+    setupBlocks = fullText.split(/(?=Setup Sheet)/i)
+      .filter(b => b.trim() && /Setup Sheet/i.test(b));
+  }
+
+  if (setupBlocks.length === 0) {
     setupBlocks = [fullText];
   }
 
   for (const block of setupBlocks) {
-    const setup: Setup = { program: '', cycle_time_s: 0, n_operations: 0, n_tools: 0, operations: [] };
+    const setup: Setup = {
+      program: '',
+      cycle_time_s: 0,
+      n_operations: 0,
+      n_tools: 0,
+      operations: [],
+    };
 
-    const progMatch = block.match(/Program\s*(\d+)/i);
+    // Program number — same as Python: "Setup Sheet for Program (\d+)"
+    const progMatch = block.match(/Setup Sheet for Program (\d+)/);
     if (progMatch) setup.program = progMatch[1];
 
-    const nopsMatch = block.match(/Number Of Operations:\s*(\d+)/i);
+    // Number of operations / tools
+    const nopsMatch = block.match(/Number Of Operations:\s*(\d+)/);
     if (nopsMatch) setup.n_operations = parseInt(nopsMatch[1], 10);
 
-    const ntoolsMatch = block.match(/Number Of Tools:\s*(\d+)/i);
+    const ntoolsMatch = block.match(/Number Of Tools:\s*(\d+)/);
     if (ntoolsMatch) setup.n_tools = parseInt(ntoolsMatch[1], 10);
 
-    const ctMatch = block.match(/(?:Estimated\s+)?Cycle Time:\s*([\dhms:]+)/i);
+    // Setup cycle time — REQUIRE "Estimated" like Python
+    const ctMatch = block.match(/Estimated Cycle Time:\s*([\dhms:]+)/);
     if (ctMatch) setup.cycle_time_s = parseCycleTime(ctMatch[1]);
 
-    // Strategy 1: Standard "Operation X/Y T<num>"
-    const opPattern = /((?:Operation|Op\.?)\s+(\d+)\s*\/\s*(\d+)\s+(T\d+)[\s\S]*?)(?=(?:Operation|Op\.?)\s+\d+\s*\/\s*\d+|$)/gi;
+    // Extract operations — same regex as Python:
+    // Operation X/Y T<n> D<n> L<n> ... until next Operation or end
+    const opPattern = /Operation\s+(\d+)\/(\d+)\s+(T\d+)\s+D\d+\s+L\d+(.*?)(?=Operation\s+\d+\/\d+|$)/gs;
     let match;
-    let opsFound = false;
 
     while ((match = opPattern.exec(block)) !== null) {
-      opsFound = true;
-      const opText = match[1];
-      const opNum = match[2];
-      const opTotal = match[3];
-      const toolT = match[4];
+      const opNum = match[1];
+      const opTotal = match[2];
+      const toolT = match[3];
+      const opText = match[0]; // full operation text including header
 
       const cutting = extractField(opText, 'Cutting Distance', true) || 0.0;
       const rapid = extractField(opText, 'Rapid Distance', true) || 0.0;
       const feedrate = extractField(opText, 'Maximum Feedrate', true) || 0.0;
 
-      const opCtMatches = [...opText.matchAll(/(?:Estimated\s+)?Cycle Time:\s*([\dhms:]+(?:\s*\([^)]*\))?)/gi)];
-      let opCt = 0;
-      const validCts = opCtMatches.map(m => parseCycleTime(m[1])).filter(ct => ct !== setup.cycle_time_s);
-      
-      if (validCts.length > 0) {
-        // The operation cycle time is usually the one that differs from the setup cycle time
-        // If there are multiple, we take the last one, as it's typically at the end of the operation block
-        opCt = validCts[validCts.length - 1];
-      } else if (opCtMatches.length > 0) {
-        opCt = parseCycleTime(opCtMatches[0][1]);
-      }
+      // Operation cycle time — simple first match like Python
+      // (no filtering, no "last match" logic)
+      const opCtMatch = opText.match(/Estimated Cycle Time:\s*([\dhms:]+(?:\s*\([^)]*\))?)/);
+      const opCt = opCtMatch ? parseCycleTime(opCtMatch[1]) : 0;
 
-      const descMatch = opText.match(/Description:\s*(.+?)(?:\s{2,}|Maximum|Minimum|$)/i);
+      // Description
+      const descMatch = opText.match(/Description:\s*(.+?)(?:\s{2,}|Maximum|Minimum|$)/);
       const description = descMatch ? descMatch[1].trim() : "";
 
       const strategy = detectStrategy(opText);
@@ -169,56 +291,16 @@ export async function parsePdfBuffer(buffer: Buffer, originalName: string): Prom
       });
     }
 
-    // Strategy 2: Fallback for "T<num> D<num>" if Strategy 1 failed
-    if (!opsFound) {
-      // Look for blocks starting with T<num> followed by D<num> (common in some compact sheets)
-      // We assume the operation starts at T<num> and goes until the next T<num>
-      const fallbackPattern = /(T\d+)\s+D\d+[\s\S]*?(?=T\d+\s+D\d+|$)/gi;
-      let opCounter = 1;
-      while ((match = fallbackPattern.exec(block)) !== null) {
-        const opText = match[0];
-        const toolT = match[1];
-
-        const cutting = extractField(opText, 'Cutting Distance', true) || 0.0;
-        const rapid = extractField(opText, 'Rapid Distance', true) || 0.0;
-        const feedrate = extractField(opText, 'Maximum Feedrate', true) || 0.0;
-
-        const opCtMatches = [...opText.matchAll(/(?:Estimated\s+)?Cycle Time:\s*([\dhms:]+(?:\s*\([^)]*\))?)/gi)];
-        let opCt = 0;
-        const validCts = opCtMatches.map(m => parseCycleTime(m[1])).filter(ct => ct !== setup.cycle_time_s);
-        
-        if (validCts.length > 0) {
-          opCt = validCts[validCts.length - 1];
-        } else if (opCtMatches.length > 0) {
-          opCt = parseCycleTime(opCtMatches[0][1]);
-        }
-
-        const strategy = detectStrategy(opText);
-        const product = extractProductCode(opText);
-
-        setup.operations.push({
-          op_num: opCounter++,
-          op_total: 0, // Unknown total in this format
-          description: "Operation " + opCounter,
-          strategy,
-          tool_t: toolT,
-          product,
-          cutting_dist: cutting,
-          rapid_dist: rapid,
-          max_feedrate: feedrate,
-          cycle_time_s: opCt,
-        });
-      }
-    }
-
     result.setups.push(setup);
   }
 
-  // If still no operations, throw an error with a snippet of text to help debug
+  // Validate
   const totalOps = result.setups.reduce((acc, s) => acc + s.operations.length, 0);
   if (totalOps === 0) {
     const snippet = fullText.substring(0, 500).replace(/\n/g, ' ');
-    throw new Error(`No operations found in '${result.name}'. Text snippet: ${snippet}...`);
+    throw new Error(
+      `No operations found in '${result.name}'. Text snippet: ${snippet}...`
+    );
   }
 
   return result;
