@@ -1,0 +1,5 @@
+{
+  "name": "CNC Vendor Rating Benchmark",
+  "description": "Compare two Fusion 360 / HSMWorks Setup Sheet PDFs to generate a comprehensive scorecard.",
+  "requestFramePermissions": []
+}
