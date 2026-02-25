@@ -1,8 +1,8 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import multer from 'multer';
-import { parsePdfBuffer } from './api/_lib/pdfParser';
-import { computeMetrics, computeScores } from './api/_lib/metrics';
+import { parsePdfBuffer } from './api/benchmark';
+import { computeMetrics, computeScores } from './api/benchmark';
 
 const upload = multer({ storage: multer.memoryStorage() });
 

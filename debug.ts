@@ -1,4 +1,4 @@
-import { parsePdfBuffer } from './api/_lib/pdfParser';
+import { parsePdfBuffer } from './api/benchmark';
 import fs from 'fs';
 import path from 'path';
 
