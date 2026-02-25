@@ -1,0 +1,9 @@
+{
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/benchmark.ts": {
+      "maxDuration": 60
+    }
+  }
+}
